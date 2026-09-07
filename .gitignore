@@ -19,3 +19,28 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Python tooling and local test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Patch files and crash dumps
+*.orig
+*.rej
+*.core
+
+# Locally compiled host test binary
+/tests/actuator_logic_test
