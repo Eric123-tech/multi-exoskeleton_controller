@@ -1,8 +1,10 @@
 #include <cstdio>
+#include <cmath>
+#include <cctype>
+#include <cstdlib>
 
 #include "actuator_logic.h"
 #include "driver/uart.h"
-
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 
@@ -51,17 +53,11 @@ constexpr uint8_t PCA9685_MODE_WAKE_AI = 0x21;
 
 constexpr uint8_t PCA9685_PRESCALE_50HZ = 0x79;
 
-constexpr float PWM_PERIOD_MS = 20.0f;
-constexpr float PWM_COUNTS = 4096.0f;
-
 
 // ============================================================
-// L12 actuator
+// Motor configuration
 // ============================================================
 
-// Table index is the public zero-based motor ID. Only listed motors are driven.
-// Set feedback_pin to -1 if no feedback wire is connected.
-// Calibration values are per motor; enable only after measuring that motor.
 struct MotorConfig {
     uint8_t pwm_channel;
     float stroke_mm;
@@ -71,54 +67,194 @@ struct MotorConfig {
     float adc_counts_per_mm;
 };
 
+
 constexpr MotorConfig MOTORS[] = {
-    // channel, stroke, feedback GPIO, calibrated, ADC at 0 mm, ADC counts/mm
-    {0, 50.0f, 34, false, 0.0f, 0.0f},
-    {1, 30.0f, 35, false, 0.0f, 0.0f},
+
+    // --------------------------------------------------------
+    // 50 mm actuators
+    // Safety limit = 47 mm
+    // --------------------------------------------------------
+
+    {0, 50.0f, 34, false, 0.0f, 0.0f},  // Motor 0
+    {1, 50.0f, 35, false, 0.0f, 0.0f},  // Motor 1
+    {2, 50.0f, -1, false, 0.0f, 0.0f},  // Motor 2
+
+    // --------------------------------------------------------
+    // 30 mm actuators
+    // Safety limit = 27 mm
+    // --------------------------------------------------------
+
+    {3, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 3
+    {4, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 4
+    {5, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 5
+    {6, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 6
+    {7, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 7
+    {8, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 8
+    {9, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 9
 };
-constexpr size_t MOTOR_COUNT = sizeof(MOTORS) / sizeof(MOTORS[0]);
-static_assert(MOTOR_COUNT > 0 && MOTOR_COUNT <= 16,
-              "One PCA9685 supports 1 through 16 configured motors");
+
+
+constexpr size_t MOTOR_COUNT =
+    sizeof(MOTORS) / sizeof(MOTORS[0]);
+
+
+static_assert(
+    MOTOR_COUNT > 0 && MOTOR_COUNT <= 16,
+    "One PCA9685 supports 1 through 16 configured motors"
+);
+
 
 constexpr bool valid_motor_config()
 {
     for (size_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (MOTORS[i].pwm_channel >= 16 ||
-            (MOTORS[i].stroke_mm != 30.0f && MOTORS[i].stroke_mm != 50.0f) ||
-            (MOTORS[i].feedback_calibrated &&
-             MOTORS[i].adc_counts_per_mm == 0.0f)) return false;
+
+        if (MOTORS[i].pwm_channel >= 16) {
+            return false;
+        }
+
+        if (MOTORS[i].stroke_mm != 30.0f &&
+            MOTORS[i].stroke_mm != 50.0f) {
+            return false;
+        }
+
+        if (MOTORS[i].feedback_calibrated &&
+            MOTORS[i].adc_counts_per_mm == 0.0f) {
+            return false;
+        }
+
         for (size_t j = 0; j < i; ++j) {
-            if (MOTORS[i].pwm_channel == MOTORS[j].pwm_channel ||
-                (MOTORS[i].feedback_pin >= 0 &&
-                 MOTORS[i].feedback_pin == MOTORS[j].feedback_pin)) return false;
+
+            if (MOTORS[i].pwm_channel ==
+                MOTORS[j].pwm_channel) {
+                return false;
+            }
+
+            if (MOTORS[i].feedback_pin >= 0 &&
+                MOTORS[i].feedback_pin ==
+                MOTORS[j].feedback_pin) {
+                return false;
+            }
         }
     }
+
     return true;
 }
-static_assert(valid_motor_config(), "Invalid or duplicate motor configuration");
+
+
+static_assert(
+    valid_motor_config(),
+    "Invalid or duplicate motor configuration"
+);
+
+
+// ============================================================
+// Motor runtime state
+// ============================================================
 
 struct MotorState {
     adc_channel_t adc_channel = {};
+
     float target_mm = 0.0f;
+
     float previous_position_mm = 0.0f;
     float filtered_velocity_mm_s = 0.0f;
+
     int64_t previous_time_us = 0;
     int64_t report_due_us = 0;
+
     int adc_raw = 0;
+
     bool feedback_ok = false;
 };
 
+
 MotorState motor_states[MOTOR_COUNT];
+
+
 constexpr int ADC_AVERAGE_SAMPLES = 16;
+
 constexpr float VELOCITY_ALPHA = 0.5f;
+
 constexpr int64_t SAMPLE_PERIOD_US = 100000;
+
 constexpr int64_t SETTLE_TIME_US = 2000000;
+
+
+// ============================================================
+// Wave configuration
+// ============================================================
+
+constexpr float PI = 3.14159265358979323846f;
+
+// One complete temporal cycle takes 4 seconds.
+constexpr float WAVE_PERIOD_S = 4.0f;
+
+// 0.45 gives normalized range:
+//
+// 0.5 - 0.45 = 0.05
+// 0.5 + 0.45 = 0.95
+//
+constexpr float WAVE_AMPLITUDE_RATIO = 0.45f;
+
+// Update motor targets at 50 Hz.
+constexpr int64_t WAVE_UPDATE_PERIOD_US = 20000;
+
+// Before wave motion begins, all motors are first commanded to 0 mm.
+constexpr float WAVE_ZERO_SETTLE_S = 1.0f;
+
+// Wave amplitude ramps up/down smoothly.
+constexpr float WAVE_RAMP_S = 1.0f;
+
+// "wave" without a number defaults to 10 seconds.
+constexpr float DEFAULT_WAVE_DURATION_S = 10.0f;
+
+constexpr float MIN_WAVE_DURATION_S = 1.0f;
+constexpr float MAX_WAVE_DURATION_S = 60.0f;
+
+
+// ============================================================
+// Wave state machine
+// ============================================================
+
+enum class WavePhase {
+    IDLE,
+    ZERO_SETTLING,
+    RUNNING
+};
+
+
+struct WaveState {
+
+    WavePhase phase = WavePhase::IDLE;
+
+    int64_t zero_start_us = 0;
+
+    int64_t run_start_us = 0;
+
+    int64_t duration_us = 0;
+
+    int64_t next_update_us = 0;
+
+    float duration_s = 0.0f;
+};
+
+
+WaveState wave_state;
+
+
+bool wave_is_active()
+{
+    return wave_state.phase != WavePhase::IDLE;
+}
+
 
 // ============================================================
 // Error helper
 // ============================================================
 
-bool check_ok(esp_err_t err, const char *operation)
+bool check_ok(
+    esp_err_t err,
+    const char *operation)
 {
     if (err == ESP_OK) {
         return true;
@@ -181,15 +317,16 @@ esp_err_t pca_read_register(
 bool initialize_pca9685(
     i2c_master_dev_handle_t device)
 {
-    // PRE_SCALE may only be changed while the oscillator sleeps.
     if (!check_ok(
             pca_write_register(
                 device,
                 PCA9685_MODE1,
                 PCA9685_MODE_SLEEP),
             "Put PCA9685 to sleep")) {
+
         return false;
     }
+
 
     if (!check_ok(
             pca_write_register(
@@ -197,24 +334,28 @@ bool initialize_pca9685(
                 PCA9685_PRESCALE,
                 PCA9685_PRESCALE_50HZ),
             "Configure PCA9685 frequency")) {
+
         return false;
     }
 
-    // Wake oscillator and enable register auto-increment.
+
     if (!check_ok(
             pca_write_register(
                 device,
                 PCA9685_MODE1,
                 PCA9685_MODE_WAKE_AI),
             "Wake PCA9685")) {
+
         return false;
     }
 
-    // Give oscillator time to stabilize.
+
     esp_rom_delay_us(1000);
+
 
     uint8_t mode1 = 0;
     uint8_t prescale = 0;
+
 
     if (!check_ok(
             pca_read_register(
@@ -222,8 +363,10 @@ bool initialize_pca9685(
                 PCA9685_MODE1,
                 mode1),
             "Read PCA9685 MODE1")) {
+
         return false;
     }
+
 
     if (!check_ok(
             pca_read_register(
@@ -231,8 +374,10 @@ bool initialize_pca9685(
                 PCA9685_PRESCALE,
                 prescale),
             "Read PCA9685 PRE_SCALE")) {
+
         return false;
     }
+
 
     ESP_LOGI(
         TAG,
@@ -241,12 +386,13 @@ bool initialize_pca9685(
         prescale
     );
 
+
     return true;
 }
 
 
 // ============================================================
-// L12 command conversion
+// Set PCA9685 PWM count
 // ============================================================
 
 esp_err_t set_pwm_count(
@@ -257,15 +403,23 @@ esp_err_t set_pwm_count(
     const uint8_t first_register =
         PCA9685_LED0_ON_L + 4 * channel;
 
+
     uint8_t data[5] = {
+
         first_register,
 
-        0x00, // ON_L
-        0x00, // ON_H
+        0x00,
+        0x00,
 
-        static_cast<uint8_t>(off_count & 0xFF),
-        static_cast<uint8_t>((off_count >> 8) & 0x0F)
+        static_cast<uint8_t>(
+            off_count & 0xFF
+        ),
+
+        static_cast<uint8_t>(
+            (off_count >> 8) & 0x0F
+        )
     };
+
 
     return i2c_master_transmit(
         device,
@@ -276,39 +430,182 @@ esp_err_t set_pwm_count(
 }
 
 
+// ============================================================
+// Set one motor position
+// ============================================================
+
 bool set_position_mm(
     i2c_master_dev_handle_t device,
     size_t motor_id,
-    float requested_mm)
+    float requested_mm,
+    bool verbose = true)
 {
-    if (motor_id >= MOTOR_COUNT || !std::isfinite(requested_mm)) return false;
-    const auto &config = MOTORS[motor_id];
-    auto &state = motor_states[motor_id];
-    const float target_mm = actuator::clamp_position(requested_mm, config.stroke_mm);
-    if (target_mm != requested_mm) {
-        ESP_LOGW(TAG, "Motor %u: %.2f mm clamped to %.2f mm (range 0-%.2f mm)",
-                 static_cast<unsigned>(motor_id), requested_mm, target_mm,
-                 config.stroke_mm - actuator::EXTENSION_MARGIN_MM);
-    }
+    if (motor_id >= MOTOR_COUNT ||
+        !std::isfinite(requested_mm)) {
 
-    const float pulse = actuator::pulse_ms(target_mm, config.stroke_mm);
-    const uint16_t count = actuator::pwm_count(pulse);
-    if (!check_ok(set_pwm_count(device, config.pwm_channel, count), "Set L12 position")) {
-        ESP_LOGE(TAG, "Motor %u command failed", static_cast<unsigned>(motor_id));
         return false;
     }
 
-    state.target_mm = target_mm;
-    // A newer command for this motor replaces its pending calibration report.
-    state.report_due_us = esp_timer_get_time() + SETTLE_TIME_US;
-    ESP_LOGI(TAG, "Motor %u channel=%u: Command %.2f mm -> %.3f ms -> %u counts",
-             static_cast<unsigned>(motor_id), config.pwm_channel, target_mm, pulse, count);
+
+    const auto &config =
+        MOTORS[motor_id];
+
+    auto &state =
+        motor_states[motor_id];
+
+
+    const float target_mm =
+        actuator::clamp_position(
+            requested_mm,
+            config.stroke_mm
+        );
+
+
+    if (verbose &&
+        target_mm != requested_mm) {
+
+        ESP_LOGW(
+            TAG,
+
+            "Motor %u: %.2f mm clamped to %.2f mm "
+            "(range 0-%.2f mm)",
+
+            static_cast<unsigned>(motor_id),
+
+            requested_mm,
+
+            target_mm,
+
+            config.stroke_mm -
+                actuator::EXTENSION_MARGIN_MM
+        );
+    }
+
+
+    const float pulse =
+        actuator::pulse_ms(
+            target_mm,
+            config.stroke_mm
+        );
+
+
+    const uint16_t count =
+        actuator::pwm_count(
+            pulse
+        );
+
+
+    if (!check_ok(
+            set_pwm_count(
+                device,
+                config.pwm_channel,
+                count),
+
+            "Set L12 position")) {
+
+        ESP_LOGE(
+            TAG,
+            "Motor %u command failed",
+            static_cast<unsigned>(motor_id)
+        );
+
+        return false;
+    }
+
+
+    state.target_mm =
+        target_mm;
+
+
+    if (verbose) {
+
+        state.report_due_us =
+            esp_timer_get_time() +
+            SETTLE_TIME_US;
+
+
+        ESP_LOGI(
+            TAG,
+
+            "Motor %u channel=%u: "
+            "Command %.2f mm -> %.3f ms -> %u counts",
+
+            static_cast<unsigned>(motor_id),
+
+            config.pwm_channel,
+
+            target_mm,
+
+            pulse,
+
+            count
+        );
+    }
+
+
     return true;
 }
 
 
 // ============================================================
-// L12 feedback
+// Move all motors to zero
+// ============================================================
+
+bool move_all_to_zero(
+    i2c_master_dev_handle_t device,
+    bool verbose)
+{
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+        if (!set_position_mm(
+                device,
+                id,
+                0.0f,
+                verbose)) {
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+// ============================================================
+// Move all motors to midpoint
+// ============================================================
+
+bool move_all_to_midpoint(
+    i2c_master_dev_handle_t device,
+    bool verbose)
+{
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+        const float midpoint =
+            MOTORS[id].stroke_mm *
+            actuator::STARTUP_RATIO;
+
+
+        if (!set_position_mm(
+                device,
+                id,
+                midpoint,
+                verbose)) {
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+// ============================================================
+// Feedback
 // ============================================================
 
 bool read_average_adc(
@@ -318,112 +615,959 @@ bool read_average_adc(
 {
     int sum = 0;
 
-    for (int i = 0; i < ADC_AVERAGE_SAMPLES; ++i) {
+
+    for (int i = 0;
+         i < ADC_AVERAGE_SAMPLES;
+         ++i) {
+
         int sample = 0;
 
-        esp_err_t err = adc_oneshot_read(
-            adc_handle,
-            adc_channel,
-            &sample
-        );
 
-        if (!check_ok(err, "Read L12 feedback ADC")) {
+        const esp_err_t err =
+            adc_oneshot_read(
+                adc_handle,
+                adc_channel,
+                &sample
+            );
+
+
+        if (!check_ok(
+                err,
+                "Read L12 feedback ADC")) {
+
             return false;
         }
+
 
         sum += sample;
     }
 
-    average_raw = sum / ADC_AVERAGE_SAMPLES;
+
+    average_raw =
+        sum / ADC_AVERAGE_SAMPLES;
+
 
     return true;
 }
 
-bool initialize_feedback(adc_oneshot_unit_handle_t &adc_handle)
-{
-    // This experiment uses ADC1 only. Additional motors can omit feedback (-1).
-    // Sharing one ADC unit handle is required for multiple channels.
-    for (size_t id = 0; id < MOTOR_COUNT; ++id) {
-        const auto &config = MOTORS[id];
-        if (config.feedback_pin < 0) continue;
-        adc_unit_t unit;
-        auto &state = motor_states[id];
-        if (!check_ok(adc_oneshot_io_to_channel(
-                          config.feedback_pin, &unit, &state.adc_channel),
-                      "Map feedback GPIO")) return false;
-        if (unit != ADC_UNIT_1) {
-            ESP_LOGE(TAG, "Motor %u: GPIO%d must use ADC1; use -1 for no feedback",
-                     static_cast<unsigned>(id), config.feedback_pin);
-            return false;
-        }
-        if (adc_handle == nullptr) {
-            adc_oneshot_unit_init_cfg_t init = {};
-            init.unit_id = ADC_UNIT_1;
-            init.ulp_mode = ADC_ULP_MODE_DISABLE;
-            if (!check_ok(adc_oneshot_new_unit(&init, &adc_handle), "Initialize ADC1"))
-                return false;
-        }
-        adc_oneshot_chan_cfg_t channel = {};
-        channel.atten = ADC_ATTEN_DB_12;
-        channel.bitwidth = ADC_BITWIDTH_DEFAULT;
-        if (!check_ok(adc_oneshot_config_channel(
-                          adc_handle, state.adc_channel, &channel),
-                      "Configure feedback channel")) return false;
-    }
-    return true;
-}
 
-void sample_feedback(adc_oneshot_unit_handle_t adc_handle)
+// ============================================================
+// Initialize feedback
+// ============================================================
+
+bool initialize_feedback(
+    adc_oneshot_unit_handle_t &adc_handle)
 {
-    for (size_t id = 0; id < MOTOR_COUNT; ++id) {
-        const auto &config = MOTORS[id];
-        auto &state = motor_states[id];
-        if (config.feedback_pin < 0) continue;
-        state.feedback_ok = read_average_adc(adc_handle, state.adc_channel, state.adc_raw);
-        if (!state.feedback_ok) {
-            ESP_LOGW(TAG, "Motor %u feedback unavailable", static_cast<unsigned>(id));
-            state.previous_time_us = 0;
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+
+        const auto &config =
+            MOTORS[id];
+
+
+        if (config.feedback_pin < 0) {
             continue;
         }
-        if (!config.feedback_calibrated) continue;
-        const float position =
-            (config.adc_at_zero - state.adc_raw) / config.adc_counts_per_mm;
-        const int64_t now = esp_timer_get_time();
-        if (state.previous_time_us > 0 && now > state.previous_time_us) {
-            const float dt = (now - state.previous_time_us) / 1000000.0f;
-            const float velocity = (position - state.previous_position_mm) / dt;
-            state.filtered_velocity_mm_s =
-                VELOCITY_ALPHA * velocity +
-                (1.0f - VELOCITY_ALPHA) * state.filtered_velocity_mm_s;
-        } else {
-            state.filtered_velocity_mm_s = 0.0f;
+
+
+        adc_unit_t unit;
+
+
+        auto &state =
+            motor_states[id];
+
+
+        if (!check_ok(
+                adc_oneshot_io_to_channel(
+                    config.feedback_pin,
+                    &unit,
+                    &state.adc_channel),
+
+                "Map feedback GPIO")) {
+
+            return false;
         }
-        state.previous_position_mm = position;
-        state.previous_time_us = now;
+
+
+        if (unit != ADC_UNIT_1) {
+
+            ESP_LOGE(
+                TAG,
+
+                "Motor %u: GPIO%d must use ADC1; "
+                "use -1 for no feedback",
+
+                static_cast<unsigned>(id),
+
+                config.feedback_pin
+            );
+
+            return false;
+        }
+
+
+        if (adc_handle == nullptr) {
+
+            adc_oneshot_unit_init_cfg_t init = {};
+
+            init.unit_id =
+                ADC_UNIT_1;
+
+            init.ulp_mode =
+                ADC_ULP_MODE_DISABLE;
+
+
+            if (!check_ok(
+                    adc_oneshot_new_unit(
+                        &init,
+                        &adc_handle),
+
+                    "Initialize ADC1")) {
+
+                return false;
+            }
+        }
+
+
+        adc_oneshot_chan_cfg_t channel = {};
+
+        channel.atten =
+            ADC_ATTEN_DB_12;
+
+        channel.bitwidth =
+            ADC_BITWIDTH_DEFAULT;
+
+
+        if (!check_ok(
+                adc_oneshot_config_channel(
+                    adc_handle,
+                    state.adc_channel,
+                    &channel),
+
+                "Configure feedback channel")) {
+
+            return false;
+        }
+    }
+
+
+    return true;
+}
+
+
+// ============================================================
+// Sample feedback
+// ============================================================
+
+void sample_feedback(
+    adc_oneshot_unit_handle_t adc_handle)
+{
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+
+        const auto &config =
+            MOTORS[id];
+
+        auto &state =
+            motor_states[id];
+
+
+        if (config.feedback_pin < 0) {
+            continue;
+        }
+
+
+        state.feedback_ok =
+            read_average_adc(
+                adc_handle,
+                state.adc_channel,
+                state.adc_raw
+            );
+
+
+        if (!state.feedback_ok) {
+
+            ESP_LOGW(
+                TAG,
+
+                "Motor %u feedback unavailable",
+
+                static_cast<unsigned>(id)
+            );
+
+
+            state.previous_time_us = 0;
+
+            continue;
+        }
+
+
+        if (!config.feedback_calibrated) {
+            continue;
+        }
+
+
+        const float position =
+            (
+                config.adc_at_zero -
+                state.adc_raw
+            )
+            /
+            config.adc_counts_per_mm;
+
+
+        const int64_t now =
+            esp_timer_get_time();
+
+
+        if (state.previous_time_us > 0 &&
+            now > state.previous_time_us) {
+
+
+            const float dt =
+                (
+                    now -
+                    state.previous_time_us
+                )
+                /
+                1000000.0f;
+
+
+            const float velocity =
+                (
+                    position -
+                    state.previous_position_mm
+                )
+                /
+                dt;
+
+
+            state.filtered_velocity_mm_s =
+
+                VELOCITY_ALPHA *
+                velocity
+
+                +
+
+                (1.0f - VELOCITY_ALPHA) *
+                state.filtered_velocity_mm_s;
+        }
+
+        else {
+
+            state.filtered_velocity_mm_s =
+                0.0f;
+        }
+
+
+        state.previous_position_mm =
+            position;
+
+
+        state.previous_time_us =
+            now;
     }
 }
 
-void report_feedback(size_t id, const char *label)
+
+// ============================================================
+// Feedback report
+// ============================================================
+
+void report_feedback(
+    size_t id,
+    const char *label)
 {
-    const auto &config = MOTORS[id];
-    const auto &state = motor_states[id];
+    const auto &config =
+        MOTORS[id];
+
+    const auto &state =
+        motor_states[id];
+
+
     if (config.feedback_pin < 0) {
-        ESP_LOGI(TAG, "%s: motor=%u command=%.2f mm feedback=disabled",
-                 label, static_cast<unsigned>(id), state.target_mm);
-    } else if (!state.feedback_ok) {
-        ESP_LOGW(TAG, "%s: motor=%u command=%.2f mm feedback=error",
-                 label, static_cast<unsigned>(id), state.target_mm);
-    } else if (!config.feedback_calibrated) {
-        ESP_LOGI(TAG, "%s: motor=%u command=%.2f mm adc=%d (uncalibrated)",
-                 label, static_cast<unsigned>(id), state.target_mm, state.adc_raw);
-    } else {
-        ESP_LOGI(TAG, "%s: motor=%u command=%.2f mm adc=%d pos=%.2f mm vel=%.2f mm/s",
-                 label, static_cast<unsigned>(id), state.target_mm, state.adc_raw,
-                 state.previous_position_mm, state.filtered_velocity_mm_s);
+
+        ESP_LOGI(
+            TAG,
+
+            "%s: motor=%u command=%.2f mm "
+            "feedback=disabled",
+
+            label,
+
+            static_cast<unsigned>(id),
+
+            state.target_mm
+        );
+    }
+
+    else if (!state.feedback_ok) {
+
+        ESP_LOGW(
+            TAG,
+
+            "%s: motor=%u command=%.2f mm "
+            "feedback=error",
+
+            label,
+
+            static_cast<unsigned>(id),
+
+            state.target_mm
+        );
+    }
+
+    else if (!config.feedback_calibrated) {
+
+        ESP_LOGI(
+            TAG,
+
+            "%s: motor=%u command=%.2f mm "
+            "adc=%d (uncalibrated)",
+
+            label,
+
+            static_cast<unsigned>(id),
+
+            state.target_mm,
+
+            state.adc_raw
+        );
+    }
+
+    else {
+
+        ESP_LOGI(
+            TAG,
+
+            "%s: motor=%u command=%.2f mm "
+            "adc=%d pos=%.2f mm vel=%.2f mm/s",
+
+            label,
+
+            static_cast<unsigned>(id),
+
+            state.target_mm,
+
+            state.adc_raw,
+
+            state.previous_position_mm,
+
+            state.filtered_velocity_mm_s
+        );
     }
 }
+
+
+// ============================================================
+// Wave command parser
+// ============================================================
+//
+// Accepted:
+//
+// wave
+// wave,15
+// wave,2.5
+// WAVE,10
+//
+// Returns:
+//
+//  0 : not a wave command
+//  1 : valid wave command
+// -1 : looks like wave, but invalid
+//
+
+int parse_wave_command(
+    const char *text,
+    float &duration_s)
+{
+    const char *p = text;
+
+
+    while (*p &&
+           std::isspace(
+               static_cast<unsigned char>(*p))) {
+
+        ++p;
+    }
+
+
+    const char word[] = "wave";
+
+
+    for (int i = 0; i < 4; ++i) {
+
+        if (p[i] == '\0') {
+            return 0;
+        }
+
+
+        if (std::tolower(
+                static_cast<unsigned char>(p[i]))
+            != word[i]) {
+
+            return 0;
+        }
+    }
+
+
+    p += 4;
+
+
+    while (*p &&
+           std::isspace(
+               static_cast<unsigned char>(*p))) {
+
+        ++p;
+    }
+
+
+    // "wave"
+    if (*p == '\0') {
+
+        duration_s =
+            DEFAULT_WAVE_DURATION_S;
+
+        return 1;
+    }
+
+
+    // Must be wave,<seconds>
+    if (*p != ',') {
+        return -1;
+    }
+
+
+    ++p;
+
+
+    while (*p &&
+           std::isspace(
+               static_cast<unsigned char>(*p))) {
+
+        ++p;
+    }
+
+
+    if (*p == '\0') {
+        return -1;
+    }
+
+
+    char *end = nullptr;
+
+
+    const float value =
+        std::strtof(
+            p,
+            &end
+        );
+
+
+    if (end == p ||
+        !std::isfinite(value)) {
+
+        return -1;
+    }
+
+
+    while (*end &&
+           std::isspace(
+               static_cast<unsigned char>(*end))) {
+
+        ++end;
+    }
+
+
+    if (*end != '\0') {
+        return -1;
+    }
+
+
+    if (value < MIN_WAVE_DURATION_S ||
+        value > MAX_WAVE_DURATION_S) {
+
+        return -1;
+    }
+
+
+    duration_s = value;
+
+    return 1;
+}
+
+
+// ============================================================
+// Start wave
+// ============================================================
+
+bool start_wave(
+    i2c_master_dev_handle_t device,
+    float duration_s)
+{
+    if (wave_is_active()) {
+
+        ESP_LOGI(
+            TAG,
+            "Restarting active WAVE"
+        );
+    }
+
+
+    wave_state.phase =
+        WavePhase::IDLE;
+
+
+    ESP_LOGI(
+        TAG,
+
+        "WAVE requested: %.2f s",
+
+        duration_s
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "Moving all motors to 0 mm before WAVE"
+    );
+
+
+    if (!move_all_to_zero(
+            device,
+            true)) {
+
+        ESP_LOGE(
+            TAG,
+            "Failed to move motors to zero"
+        );
+
+        return false;
+    }
+
+
+    const int64_t now =
+        esp_timer_get_time();
+
+
+    wave_state.phase =
+        WavePhase::ZERO_SETTLING;
+
+
+    wave_state.zero_start_us =
+        now;
+
+
+    wave_state.duration_s =
+        duration_s;
+
+
+    wave_state.duration_us =
+        static_cast<int64_t>(
+            duration_s *
+            1000000.0f
+        );
+
+
+    wave_state.next_update_us =
+        0;
+
+
+    ESP_LOGI(
+        TAG,
+
+        "WAVE zero settling: %.2f s",
+
+        WAVE_ZERO_SETTLE_S
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// Cancel wave
+// ============================================================
+
+void cancel_wave()
+{
+    if (!wave_is_active()) {
+        return;
+    }
+
+
+    if (wave_state.phase ==
+        WavePhase::RUNNING) {
+
+
+        const float elapsed_s =
+            (
+                esp_timer_get_time() -
+                wave_state.run_start_us
+            )
+            /
+            1000000.0f;
+
+
+        ESP_LOGI(
+            TAG,
+
+            "WAVE interrupted at %.2f s",
+
+            elapsed_s
+        );
+    }
+
+    else {
+
+        ESP_LOGI(
+            TAG,
+
+            "WAVE interrupted during zero settling"
+        );
+    }
+
+
+    wave_state.phase =
+        WavePhase::IDLE;
+}
+
+
+// ============================================================
+// Update wave state machine
+// ============================================================
+
+void update_wave(
+    i2c_master_dev_handle_t device,
+    int64_t now)
+{
+    // --------------------------------------------------------
+    // IDLE
+    // --------------------------------------------------------
+
+    if (wave_state.phase ==
+        WavePhase::IDLE) {
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Waiting at zero
+    // --------------------------------------------------------
+
+    if (wave_state.phase ==
+        WavePhase::ZERO_SETTLING) {
+
+
+        const int64_t zero_settle_us =
+            static_cast<int64_t>(
+                WAVE_ZERO_SETTLE_S *
+                1000000.0f
+            );
+
+
+        if (now -
+            wave_state.zero_start_us
+            >= zero_settle_us) {
+
+
+            wave_state.phase =
+                WavePhase::RUNNING;
+
+
+            wave_state.run_start_us =
+                now;
+
+
+            wave_state.next_update_us =
+                now;
+
+
+            ESP_LOGI(
+                TAG,
+
+                "WAVE started: duration=%.2f s, "
+                "period=%.2f s, amplitude=%.2f",
+
+                wave_state.duration_s,
+
+                WAVE_PERIOD_S,
+
+                WAVE_AMPLITUDE_RATIO
+            );
+        }
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Wave running
+    // --------------------------------------------------------
+
+    if (wave_state.phase !=
+        WavePhase::RUNNING) {
+
+        return;
+    }
+
+
+    const int64_t elapsed_us =
+        now -
+        wave_state.run_start_us;
+
+
+    // --------------------------------------------------------
+    // Wave complete
+    // --------------------------------------------------------
+
+    if (elapsed_us >=
+        wave_state.duration_us) {
+
+
+        wave_state.phase =
+            WavePhase::IDLE;
+
+
+        ESP_LOGI(
+            TAG,
+
+            "WAVE finished after %.2f s",
+
+            wave_state.duration_s
+        );
+
+
+        ESP_LOGI(
+            TAG,
+
+            "Returning all motors to 0 mm"
+        );
+
+
+        move_all_to_zero(
+            device,
+            true
+        );
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Only update targets at 50 Hz
+    // --------------------------------------------------------
+
+    if (now <
+        wave_state.next_update_us) {
+
+        return;
+    }
+
+
+    wave_state.next_update_us =
+        now +
+        WAVE_UPDATE_PERIOD_US;
+
+
+    const float elapsed_s =
+        elapsed_us /
+        1000000.0f;
+
+
+    // ========================================================
+    // Smooth amplitude envelope
+    // ========================================================
+    //
+    // For normal long waves:
+    //
+    // 0 -> 1 during first second
+    // stays at 1
+    // 1 -> 0 during final second
+    //
+    // For very short wave durations, ramp time is automatically
+    // reduced to half the requested wave duration.
+    // ========================================================
+
+    float ramp_s =
+        WAVE_RAMP_S;
+
+
+    if (wave_state.duration_s <
+        2.0f * ramp_s) {
+
+        ramp_s =
+            wave_state.duration_s *
+            0.5f;
+    }
+
+
+    float ramp_up = 1.0f;
+
+
+    if (ramp_s > 0.0f &&
+        elapsed_s < ramp_s) {
+
+        ramp_up =
+            elapsed_s /
+            ramp_s;
+    }
+
+
+    const float remaining_s =
+        wave_state.duration_s -
+        elapsed_s;
+
+
+    float ramp_down = 1.0f;
+
+
+    if (ramp_s > 0.0f &&
+        remaining_s < ramp_s) {
+
+        ramp_down =
+            remaining_s /
+            ramp_s;
+    }
+
+
+    float envelope =
+        std::fmin(
+            ramp_up,
+            ramp_down
+        );
+
+
+    if (envelope < 0.0f) {
+        envelope = 0.0f;
+    }
+
+
+    if (envelope > 1.0f) {
+        envelope = 1.0f;
+    }
+
+
+    // ========================================================
+    // Traveling sine wave
+    // ========================================================
+
+    const float omega =
+        2.0f *
+        PI /
+        WAVE_PERIOD_S;
+
+
+    const float phase_step =
+        2.0f *
+        PI /
+        static_cast<float>(
+            MOTOR_COUNT
+        );
+
+
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+
+        const auto &config =
+            MOTORS[id];
+
+
+        // Safe usable length:
+        //
+        // 50 mm actuator -> 47 mm
+        // 30 mm actuator -> 27 mm
+
+        const float safe_length_mm =
+            config.stroke_mm -
+            actuator::EXTENSION_MARGIN_MM;
+
+
+        // The minus sign makes the wave travel:
+        //
+        // 0 -> 1 -> 2 -> ... -> 9
+
+        const float phase =
+            omega *
+            elapsed_s
+
+            -
+
+            phase_step *
+            static_cast<float>(id);
+
+
+        // Full-amplitude normalized range:
+        //
+        // 0.05 -> 0.95
+
+        const float normalized_position =
+            0.5f
+
+            +
+
+            WAVE_AMPLITUDE_RATIO *
+            std::sin(phase);
+
+
+        // envelope causes:
+        //
+        // start: all motors at 0
+        // ramp up smoothly
+        // run traveling wave
+        // ramp down smoothly
+        // end: all motors at 0
+
+        const float target_mm =
+            envelope *
+            safe_length_mm *
+            normalized_position;
+
+
+        // Silent command during wave.
+        //
+        // Otherwise 10 motors x 50 Hz would produce
+        // 500 log messages per second.
+
+        if (!set_position_mm(
+                device,
+                id,
+                target_mm,
+                false)) {
+
+
+            ESP_LOGE(
+                TAG,
+
+                "WAVE motor %u update failed",
+
+                static_cast<unsigned>(id)
+            );
+
+
+            wave_state.phase =
+                WavePhase::IDLE;
+
+
+            return;
+        }
+    }
+}
+
 
 } // namespace
+
 
 
 // ============================================================
@@ -432,173 +1576,636 @@ void report_feedback(size_t id, const char *label)
 
 extern "C" void app_main()
 {
-    ESP_LOGI(TAG, "Exoskeleton controller starting!");
+    ESP_LOGI(
+        TAG,
+        "Exoskeleton controller starting!"
+    );
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // I2C bus
-    // --------------------------------------------------------
+    // ========================================================
 
     i2c_master_bus_config_t bus_config = {};
 
-    bus_config.i2c_port = I2C_NUM_0;
-    bus_config.sda_io_num = I2C_SDA_PIN;
-    bus_config.scl_io_num = I2C_SCL_PIN;
-    bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_config.glitch_ignore_cnt = 7;
-    bus_config.flags.enable_internal_pullup = true;
 
-    i2c_master_bus_handle_t bus_handle = nullptr;
+    bus_config.i2c_port =
+        I2C_NUM_0;
+
+
+    bus_config.sda_io_num =
+        I2C_SDA_PIN;
+
+
+    bus_config.scl_io_num =
+        I2C_SCL_PIN;
+
+
+    bus_config.clk_source =
+        I2C_CLK_SRC_DEFAULT;
+
+
+    bus_config.glitch_ignore_cnt =
+        7;
+
+
+    bus_config.flags.enable_internal_pullup =
+        true;
+
+
+    i2c_master_bus_handle_t bus_handle =
+        nullptr;
+
 
     if (!check_ok(
             i2c_new_master_bus(
                 &bus_config,
                 &bus_handle),
+
             "Create I2C bus")) {
+
         return;
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // PCA9685
-    // --------------------------------------------------------
+    // ========================================================
 
     if (!check_ok(
             i2c_master_probe(
                 bus_handle,
                 PCA9685_ADDRESS,
                 I2C_TIMEOUT_MS),
+
             "Probe PCA9685")) {
+
         return;
     }
 
+
     i2c_device_config_t device_config = {};
+
 
     device_config.dev_addr_length =
         I2C_ADDR_BIT_LEN_7;
 
+
     device_config.device_address =
         PCA9685_ADDRESS;
+
 
     device_config.scl_speed_hz =
         I2C_SPEED_HZ;
 
-    i2c_master_dev_handle_t pca_handle = nullptr;
+
+    i2c_master_dev_handle_t pca_handle =
+        nullptr;
+
 
     if (!check_ok(
             i2c_master_bus_add_device(
                 bus_handle,
                 &device_config,
                 &pca_handle),
+
             "Add PCA9685 device")) {
+
         return;
     }
 
-    if (!initialize_pca9685(pca_handle)) {
+
+    if (!initialize_pca9685(
+            pca_handle)) {
+
         return;
     }
 
 
-    // Configure all feedback inputs before issuing startup movement commands.
-    adc_oneshot_unit_handle_t adc_handle = nullptr;
-    if (!initialize_feedback(adc_handle)) return;
+    // ========================================================
+    // ADC feedback
+    // ========================================================
 
-    // Explicit buffered, nonblocking UART receive: feedback does not depend on typing.
-    // stdout keeps using the default ESP-IDF UART0 console for logs and echo.
+    adc_oneshot_unit_handle_t adc_handle =
+        nullptr;
+
+
+    if (!initialize_feedback(
+            adc_handle)) {
+
+        return;
+    }
+
+
+    // ========================================================
+    // UART0
+    // ========================================================
+
     uart_config_t uart_config = {};
-    uart_config.baud_rate = 115200;
-    uart_config.data_bits = UART_DATA_8_BITS;
-    uart_config.parity = UART_PARITY_DISABLE;
-    uart_config.stop_bits = UART_STOP_BITS_1;
-    uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-    uart_config.source_clk = UART_SCLK_DEFAULT;
-    if (!check_ok(uart_param_config(UART_NUM_0, &uart_config), "Configure UART0") ||
-        !check_ok(uart_driver_install(UART_NUM_0, 1024, 0, 0, nullptr, 0),
-                  "Install UART0 driver")) return;
 
-    for (size_t id = 0; id < MOTOR_COUNT; ++id) {
-        const auto &config = MOTORS[id];
-        ESP_LOGI(TAG, "Motor %u: channel=%u stroke=%.0f mm limit=%.0f mm feedback=GPIO%d",
-                 static_cast<unsigned>(id), config.pwm_channel, config.stroke_mm,
-                 config.stroke_mm - actuator::EXTENSION_MARGIN_MM, config.feedback_pin);
-        if (!set_position_mm(pca_handle, id, config.stroke_mm * actuator::STARTUP_RATIO))
-            return;
+
+    uart_config.baud_rate =
+        115200;
+
+
+    uart_config.data_bits =
+        UART_DATA_8_BITS;
+
+
+    uart_config.parity =
+        UART_PARITY_DISABLE;
+
+
+    uart_config.stop_bits =
+        UART_STOP_BITS_1;
+
+
+    uart_config.flow_ctrl =
+        UART_HW_FLOWCTRL_DISABLE;
+
+
+    uart_config.source_clk =
+        UART_SCLK_DEFAULT;
+
+
+    if (!check_ok(
+            uart_param_config(
+                UART_NUM_0,
+                &uart_config),
+
+            "Configure UART0")
+
+        ||
+
+        !check_ok(
+            uart_driver_install(
+                UART_NUM_0,
+                1024,
+                0,
+                0,
+                nullptr,
+                0),
+
+            "Install UART0 driver")) {
+
+        return;
     }
 
-    ESP_LOGI(TAG, "Serial ready. Send: P,<position_mm>,<motor_id> (IDs 0-%u)",
-             static_cast<unsigned>(MOTOR_COUNT - 1));
+
+    // ========================================================
+    // Startup: all motors to midpoint
+    // ========================================================
+
+    ESP_LOGI(
+        TAG,
+
+        "Configured %u motors",
+
+        static_cast<unsigned>(
+            MOTOR_COUNT
+        )
+    );
+
+
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+
+        const auto &config =
+            MOTORS[id];
+
+
+        ESP_LOGI(
+            TAG,
+
+            "Motor %u: channel=%u "
+            "stroke=%.0f mm "
+            "limit=%.0f mm "
+            "feedback=GPIO%d",
+
+            static_cast<unsigned>(id),
+
+            config.pwm_channel,
+
+            config.stroke_mm,
+
+            config.stroke_mm -
+            actuator::EXTENSION_MARGIN_MM,
+
+            config.feedback_pin
+        );
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "Moving all motors to startup midpoint"
+    );
+
+
+    if (!move_all_to_midpoint(
+            pca_handle,
+            true)) {
+
+        return;
+    }
+
+
+    // ========================================================
+    // Command information
+    // ========================================================
+
+    ESP_LOGI(
+        TAG,
+
+        "Commands:"
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "  P,<position_mm>,<motor_id>   IDs 0-%u",
+
+        static_cast<unsigned>(
+            MOTOR_COUNT - 1
+        )
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "  wave                        default %.0f s",
+
+        DEFAULT_WAVE_DURATION_S
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "  wave,<seconds>              range %.0f-%.0f s",
+
+        MIN_WAVE_DURATION_S,
+
+        MAX_WAVE_DURATION_S
+    );
+
+
+    // ========================================================
+    // UART command buffer
+    // ========================================================
 
     char command_buffer[64] = {};
+
     size_t command_length = 0;
+
     bool line_overflow = false;
+
     int startup_samples_remaining = 30;
-    int64_t next_sample_us = esp_timer_get_time();
+
+    int64_t next_sample_us =
+        esp_timer_get_time();
+
+
+    // ========================================================
+    // Main loop
+    // ========================================================
 
     while (true) {
+
+
+        // ====================================================
+        // UART input
+        // ====================================================
+
         uint8_t incoming[64];
-        const int received = uart_read_bytes(UART_NUM_0, incoming, sizeof(incoming), 0);
-        for (int i = 0; i < received; ++i) {
-            const int c = incoming[i];
-            if (c == '\n' || c == '\r') {
-                if (command_length > 0 || line_overflow) {
+
+
+        const int received =
+            uart_read_bytes(
+                UART_NUM_0,
+                incoming,
+                sizeof(incoming),
+                0
+            );
+
+
+        for (int i = 0;
+             i < received;
+             ++i) {
+
+
+            const int c =
+                incoming[i];
+
+
+            // ------------------------------------------------
+            // Enter
+            // ------------------------------------------------
+
+            if (c == '\n' ||
+                c == '\r') {
+
+
+                if (command_length > 0 ||
+                    line_overflow) {
+
+
                     putchar('\n');
                     fflush(stdout);
-                    command_buffer[command_length] = '\0';
-                    actuator::Command command = {};
+
+
+                    command_buffer[
+                        command_length
+                    ] = '\0';
+
+
                     if (line_overflow) {
-                        ESP_LOGW(TAG, "Command too long; entire line rejected");
-                    } else if (!actuator::parse_command(command_buffer, MOTOR_COUNT, command)) {
-                        ESP_LOGW(TAG, "Invalid command: %s. Use P,<position_mm>,<motor_id>; IDs 0-%u",
-                                 command_buffer, static_cast<unsigned>(MOTOR_COUNT - 1));
-                    } else {
-                        set_position_mm(pca_handle, command.motor_id, command.position_mm);
+
+
+                        ESP_LOGW(
+                            TAG,
+
+                            "Command too long; "
+                            "entire line rejected"
+                        );
                     }
+
+                    else {
+
+                        // ====================================
+                        // First try WAVE command
+                        // ====================================
+
+                        float wave_duration_s = 0.0f;
+
+
+                        const int wave_result =
+                            parse_wave_command(
+                                command_buffer,
+                                wave_duration_s
+                            );
+
+
+                        if (wave_result == 1) {
+
+
+                            start_wave(
+                                pca_handle,
+                                wave_duration_s
+                            );
+                        }
+
+
+                        else if (wave_result == -1) {
+
+
+                            ESP_LOGW(
+                                TAG,
+
+                                "Invalid wave command. "
+                                "Use wave or wave,<seconds>; "
+                                "range %.0f-%.0f s",
+
+                                MIN_WAVE_DURATION_S,
+
+                                MAX_WAVE_DURATION_S
+                            );
+                        }
+
+
+                        // ====================================
+                        // Otherwise try P command
+                        // ====================================
+
+                        else {
+
+
+                            actuator::Command command = {};
+
+
+                            if (!actuator::parse_command(
+                                    command_buffer,
+                                    MOTOR_COUNT,
+                                    command)) {
+
+
+                                ESP_LOGW(
+                                    TAG,
+
+                                    "Invalid command: %s. "
+                                    "Use P,<position_mm>,<motor_id> "
+                                    "or wave,<seconds>",
+
+                                    command_buffer
+                                );
+                            }
+
+                            else {
+
+
+                                // ============================
+                                // P immediately interrupts wave
+                                // ============================
+
+                                if (wave_is_active()) {
+
+
+                                    cancel_wave();
+
+
+                                    ESP_LOGI(
+                                        TAG,
+
+                                        "Manual P command now has control"
+                                    );
+                                }
+
+
+                                set_position_mm(
+                                    pca_handle,
+                                    command.motor_id,
+                                    command.position_mm,
+                                    true
+                                );
+                            }
+                        }
+                    }
+
+
                     command_length = 0;
+
                     line_overflow = false;
                 }
-            } else if (c == '\b' || c == 0x7F) {
-                if (!line_overflow && command_length > 0) {
+            }
+
+
+            // ------------------------------------------------
+            // Backspace
+            // ------------------------------------------------
+
+            else if (
+                c == '\b' ||
+                c == 0x7F) {
+
+
+                if (!line_overflow &&
+                    command_length > 0) {
+
+
                     --command_length;
-                    fputs("\b \b", stdout);
+
+
+                    fputs(
+                        "\b \b",
+                        stdout
+                    );
+
+
                     fflush(stdout);
                 }
-            } else if (c >= 0x20 && c <= 0x7E) {
-                if (!line_overflow && command_length < sizeof(command_buffer) - 1) {
-                    command_buffer[command_length++] = static_cast<char>(c);
+            }
+
+
+            // ------------------------------------------------
+            // Printable characters
+            // ------------------------------------------------
+
+            else if (
+                c >= 0x20 &&
+                c <= 0x7E) {
+
+
+                if (!line_overflow &&
+                    command_length <
+                    sizeof(command_buffer) - 1) {
+
+
+                    command_buffer[
+                        command_length++
+                    ] =
+                        static_cast<char>(c);
+
+
                     putchar(c);
+
                     fflush(stdout);
-                } else {
-                    // Never execute a truncated prefix of an overlong command.
+                }
+
+                else {
+
                     line_overflow = true;
                 }
-            } else {
-                // Reject unsupported control bytes instead of silently changing a command.
+            }
+
+
+            else {
+
                 line_overflow = true;
             }
         }
 
-        const int64_t now = esp_timer_get_time();
-        if (now >= next_sample_us) {
-            sample_feedback(adc_handle);
-            next_sample_us = esp_timer_get_time() + SAMPLE_PERIOD_US;
-            // Avoid interleaving routine feedback logs with a partly typed command.
+
+        // ====================================================
+        // Timing
+        // ====================================================
+
+        const int64_t now =
+            esp_timer_get_time();
+
+
+        // ====================================================
+        // Non-blocking WAVE update
+        // ====================================================
+
+        update_wave(
+            pca_handle,
+            now
+        );
+
+
+        // ====================================================
+        // Feedback sampling
+        // ====================================================
+
+        if (now >=
+            next_sample_us) {
+
+
+            sample_feedback(
+                adc_handle
+            );
+
+
+            next_sample_us =
+                esp_timer_get_time() +
+                SAMPLE_PERIOD_US;
+
+
             if (startup_samples_remaining > 0) {
-                if (command_length == 0 && !line_overflow) {
-                    for (size_t id = 0; id < MOTOR_COUNT; ++id)
-                        report_feedback(id, "SAMPLE");
+
+
+                // Avoid destroying the line being typed.
+                if (command_length == 0 &&
+                    !line_overflow) {
+
+
+                    for (size_t id = 0;
+                         id < MOTOR_COUNT;
+                         ++id) {
+
+
+                        report_feedback(
+                            id,
+                            "SAMPLE"
+                        );
+                    }
                 }
+
+
                 --startup_samples_remaining;
             }
         }
-        if (command_length == 0 && !line_overflow) {
-            for (size_t id = 0; id < MOTOR_COUNT; ++id) {
-                auto &state = motor_states[id];
-                if (state.report_due_us > 0 && now >= state.report_due_us) {
-                    report_feedback(id, "CAL");
+
+
+        // ====================================================
+        // Delayed reports
+        // ====================================================
+
+        if (command_length == 0 &&
+            !line_overflow) {
+
+
+            for (size_t id = 0;
+                 id < MOTOR_COUNT;
+                 ++id) {
+
+
+                auto &state =
+                    motor_states[id];
+
+
+                if (state.report_due_us > 0 &&
+                    now >= state.report_due_us) {
+
+
+                    report_feedback(
+                        id,
+                        "CAL"
+                    );
+
+
                     state.report_due_us = 0;
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(10)
+        );
     }
 }
