@@ -18,6 +18,14 @@ int main()
     }
     assert(parse_command("P,20,8", 9, c) && c.motor_id == 8);
     assert(!parse_command("P,20,9", 9, c));
+    assert(parse_command("P,20,9", 10, c) && c.motor_id == 9);
+    assert(!parse_command("P,20,10", 10, c));
+    assert(matches_command_word("close", "close"));
+    assert(matches_command_word("  CLOSE \t", "close"));
+    assert(matches_command_word("Open", "open"));
+    assert(!matches_command_word("close,1", "close"));
+    assert(!matches_command_word("closed", "close"));
+    assert(!matches_command_word("", "close"));
     assert(clamp_position(35, 30) == 27);
     assert(clamp_position(35, 50) == 35);
     assert(clamp_position(60, 50) == 47);
@@ -31,4 +39,9 @@ int main()
     assert(pwm_count(pulse_ms(15, 30)) == 307);
     assert(pwm_count(pulse_ms(60, 30)) == 389);
     assert(pwm_count(pulse_ms(60, 50)) == 397);
+    assert(smoothstep01(-1.0f) == 0.0f);
+    assert(smoothstep01(0.0f) == 0.0f);
+    assert(smoothstep01(0.5f) == 0.5f);
+    assert(smoothstep01(1.0f) == 1.0f);
+    assert(smoothstep01(2.0f) == 1.0f);
 }
