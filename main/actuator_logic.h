@@ -10,13 +10,19 @@
 namespace actuator {
 
 constexpr float EXTENSION_MARGIN_MM = 3.0f;
-constexpr float STARTUP_RATIO = 0.5f;
 
 inline float clamp_position(float position, float stroke)
 {
     if (position < 0.0f) return 0.0f;
     const float limit = stroke - EXTENSION_MARGIN_MM;
     return position > limit ? limit : position;
+}
+
+inline float smoothstep01(float progress)
+{
+    if (progress <= 0.0f) return 0.0f;
+    if (progress >= 1.0f) return 1.0f;
+    return progress * progress * (3.0f - 2.0f * progress);
 }
 
 inline float pulse_ms(float position, float stroke)
@@ -38,6 +44,25 @@ struct Command {
 inline void skip_space(const char *&cursor)
 {
     while (std::isspace(static_cast<unsigned char>(*cursor))) ++cursor;
+}
+
+// Match one case-insensitive command word with optional surrounding whitespace.
+inline bool matches_command_word(const char *line, const char *word)
+{
+    const char *cursor = line;
+    skip_space(cursor);
+
+    while (*word != '\0') {
+        if (std::tolower(static_cast<unsigned char>(*cursor)) !=
+            std::tolower(static_cast<unsigned char>(*word))) {
+            return false;
+        }
+        ++cursor;
+        ++word;
+    }
+
+    skip_space(cursor);
+    return *cursor == '\0';
 }
 
 // Only P,<finite position>,<zero-based integer ID>, with optional whitespace.

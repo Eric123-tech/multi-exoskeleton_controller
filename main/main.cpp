@@ -69,28 +69,18 @@ struct MotorConfig {
 
 
 constexpr MotorConfig MOTORS[] = {
-
-    // --------------------------------------------------------
-    // 50 mm actuators
-    // Safety limit = 47 mm
-    // --------------------------------------------------------
-
-    {0, 50.0f, 34, false, 0.0f, 0.0f},  // Motor 0
-    {1, 50.0f, 35, false, 0.0f, 0.0f},  // Motor 1
-    {2, 50.0f, -1, false, 0.0f, 0.0f},  // Motor 2
-
-    // --------------------------------------------------------
-    // 30 mm actuators
-    // Safety limit = 27 mm
-    // --------------------------------------------------------
-
-    {3, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 3
-    {4, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 4
-    {5, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 5
-    {6, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 6
-    {7, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 7
-    {8, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 8
-    {9, 30.0f, -1, false, 0.0f, 0.0f},  // Motor 9
+    // ID/channel, stroke, feedback GPIO, calibrated, ADC at zero, counts/mm
+    // Each finger is ordered near-palm first, far-from-palm second.
+    {0, 30.0f, 34, false, 0.0f, 0.0f},  // 0: thumb near
+    {1, 30.0f, 35, false, 0.0f, 0.0f},  // 1: thumb far
+    {2, 50.0f, -1, false, 0.0f, 0.0f},  // 2: index near
+    {3, 30.0f, -1, false, 0.0f, 0.0f},  // 3: index far
+    {4, 50.0f, -1, false, 0.0f, 0.0f},  // 4: middle near
+    {5, 30.0f, -1, false, 0.0f, 0.0f},  // 5: middle far
+    {6, 50.0f, -1, false, 0.0f, 0.0f},  // 6: ring near
+    {7, 30.0f, -1, false, 0.0f, 0.0f},  // 7: ring far
+    {8, 30.0f, -1, false, 0.0f, 0.0f},  // 8: little near
+    {9, 30.0f, -1, false, 0.0f, 0.0f},  // 9: little far
 };
 
 
@@ -210,6 +200,75 @@ constexpr float DEFAULT_WAVE_DURATION_S = 10.0f;
 
 constexpr float MIN_WAVE_DURATION_S = 1.0f;
 constexpr float MAX_WAVE_DURATION_S = 60.0f;
+
+
+// ============================================================
+// Hard-coded grasp configuration
+// ============================================================
+
+// Near-palm motors travel 10 mm. Far motors use their configured
+// maximum (27 mm for a 30 mm actuator with the 3 mm margin).
+constexpr float CLOSE_TARGET_MM[] = {
+    10.0f, 27.0f,  // thumb
+    10.0f, 27.0f,  // index
+    10.0f, 27.0f,  // middle
+    10.0f, 27.0f,  // ring
+    10.0f, 27.0f,  // little
+};
+
+static_assert(
+    sizeof(CLOSE_TARGET_MM) / sizeof(CLOSE_TARGET_MM[0]) == MOTOR_COUNT,
+    "Close pose must contain one target per motor"
+);
+
+constexpr bool valid_close_pose()
+{
+    for (size_t id = 0; id < MOTOR_COUNT; ++id) {
+        if (CLOSE_TARGET_MM[id] < 0.0f ||
+            CLOSE_TARGET_MM[id] >
+                MOTORS[id].stroke_mm - actuator::EXTENSION_MARGIN_MM) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(valid_close_pose(), "Close pose exceeds a motor safety limit");
+
+constexpr float GRASP_MOVE_DURATION_S = 3.0f;
+constexpr int64_t GRASP_UPDATE_PERIOD_US = 20000;
+
+// Each finger owns two adjacent motor IDs. During CLOSE and OPEN,
+// the next finger begins 150 ms later to reduce simultaneous startup load.
+constexpr size_t MOTORS_PER_FINGER = 2;
+constexpr int64_t FINGER_STAGGER_US = 150000;
+
+static_assert(
+    MOTOR_COUNT % MOTORS_PER_FINGER == 0,
+    "Each finger must contain exactly two motors"
+);
+
+constexpr size_t FINGER_COUNT =
+    MOTOR_COUNT / MOTORS_PER_FINGER;
+
+
+enum class GraspGoal {
+    OPEN,
+    CLOSE
+};
+
+
+struct GraspState {
+    bool active = false;
+    GraspGoal goal = GraspGoal::OPEN;
+    int64_t start_us = 0;
+    int64_t duration_us = 0;
+    int64_t next_update_us = 0;
+    float start_mm[MOTOR_COUNT] = {};
+};
+
+
+GraspState grasp_state;
 
 
 // ============================================================
@@ -574,33 +633,296 @@ bool move_all_to_zero(
 
 
 // ============================================================
-// Move all motors to midpoint
+// Hard-coded grasp motion
 // ============================================================
 
-bool move_all_to_midpoint(
-    i2c_master_dev_handle_t device,
-    bool verbose)
+const char *grasp_goal_name(
+    GraspGoal goal)
 {
+    return goal == GraspGoal::CLOSE
+        ? "CLOSE"
+        : "OPEN";
+}
+
+
+bool grasp_is_active()
+{
+    return grasp_state.active;
+}
+
+
+void cancel_grasp()
+{
+    if (!grasp_is_active()) {
+        return;
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "%s interrupted",
+        grasp_goal_name(grasp_state.goal)
+    );
+
+
+    grasp_state.active = false;
+}
+
+
+float grasp_target_mm(
+    GraspGoal goal,
+    size_t motor_id)
+{
+    return goal == GraspGoal::CLOSE
+        ? CLOSE_TARGET_MM[motor_id]
+        : 0.0f;
+}
+
+
+int64_t grasp_start_delay_us(
+    size_t motor_id)
+{
+    const size_t finger_id =
+        motor_id / MOTORS_PER_FINGER;
+
+
+    return static_cast<int64_t>(finger_id) *
+        FINGER_STAGGER_US;
+}
+
+
+int64_t grasp_total_duration_us(
+    int64_t movement_duration_us)
+{
+    return movement_duration_us +
+        static_cast<int64_t>(FINGER_COUNT - 1) *
+        FINGER_STAGGER_US;
+}
+
+
+void start_grasp(
+    GraspGoal goal)
+{
+    if (grasp_is_active() &&
+        grasp_state.goal == goal) {
+
+        ESP_LOGI(
+            TAG,
+            "%s already in progress",
+            grasp_goal_name(goal)
+        );
+
+        return;
+    }
+
+
+    bool already_at_target = true;
+
+
     for (size_t id = 0;
          id < MOTOR_COUNT;
          ++id) {
 
-        const float midpoint =
-            MOTORS[id].stroke_mm *
-            actuator::STARTUP_RATIO;
+        const float target_mm =
+            grasp_target_mm(goal, id);
+
+
+        if (std::fabs(
+                motor_states[id].target_mm -
+                target_mm) > 0.001f) {
+
+            already_at_target = false;
+        }
+    }
+
+
+    if (already_at_target) {
+
+        grasp_state.active = false;
+
+        ESP_LOGI(
+            TAG,
+            "%s already at target",
+            grasp_goal_name(goal)
+        );
+
+        return;
+    }
+
+
+    const int64_t now =
+        esp_timer_get_time();
+
+
+    grasp_state.active = true;
+    grasp_state.goal = goal;
+    grasp_state.start_us = now;
+    grasp_state.duration_us =
+        static_cast<int64_t>(
+            GRASP_MOVE_DURATION_S *
+            1000000.0f
+        );
+    grasp_state.next_update_us = now;
+
+
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+        grasp_state.start_mm[id] =
+            motor_states[id].target_mm;
+    }
+
+
+    const float total_duration_s =
+        grasp_total_duration_us(
+            grasp_state.duration_us
+        ) /
+        1000000.0f;
+
+
+    ESP_LOGI(
+        TAG,
+        "%s started: %.2f s per finger, "
+        "%lld ms stagger, %.2f s total",
+        grasp_goal_name(goal),
+        GRASP_MOVE_DURATION_S,
+        static_cast<long long>(
+            FINGER_STAGGER_US /
+            1000
+        ),
+        total_duration_s
+    );
+
+
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+        ESP_LOGI(
+            TAG,
+            "  motor %u: %.2f -> %.2f mm, delay=%lld ms",
+            static_cast<unsigned>(id),
+            grasp_state.start_mm[id],
+            grasp_target_mm(goal, id),
+            static_cast<long long>(
+                grasp_start_delay_us(id) /
+                1000
+            )
+        );
+    }
+}
+
+
+void update_grasp(
+    i2c_master_dev_handle_t device,
+    int64_t now)
+{
+    if (!grasp_is_active() ||
+        now < grasp_state.next_update_us) {
+
+        return;
+    }
+
+
+    const int64_t elapsed_us =
+        now - grasp_state.start_us;
+
+
+    for (size_t id = 0;
+         id < MOTOR_COUNT;
+         ++id) {
+
+
+        const int64_t start_delay_us =
+            grasp_start_delay_us(
+                id
+            );
+
+
+        if (elapsed_us < start_delay_us) {
+            continue;
+        }
+
+
+        const int64_t local_elapsed_us =
+            elapsed_us - start_delay_us;
+
+
+        float progress =
+            static_cast<float>(local_elapsed_us) /
+            static_cast<float>(grasp_state.duration_us);
+
+
+        if (progress > 1.0f) {
+            progress = 1.0f;
+        }
+
+
+        const float blend =
+            actuator::smoothstep01(progress);
+
+
+        const float final_mm =
+            grasp_target_mm(
+                grasp_state.goal,
+                id
+            );
+
+
+        const float target_mm =
+            grasp_state.start_mm[id]
+            +
+            blend *
+            (final_mm - grasp_state.start_mm[id]);
 
 
         if (!set_position_mm(
                 device,
                 id,
-                midpoint,
-                verbose)) {
+                target_mm,
+                false)) {
 
-            return false;
+            ESP_LOGE(
+                TAG,
+                "%s motor %u update failed",
+                grasp_goal_name(grasp_state.goal),
+                static_cast<unsigned>(id)
+            );
+
+
+            grasp_state.active = false;
+
+
+            return;
         }
     }
 
-    return true;
+
+    const int64_t total_duration_us =
+        grasp_total_duration_us(
+            grasp_state.duration_us
+        );
+
+
+    if (elapsed_us >= total_duration_us) {
+
+        ESP_LOGI(
+            TAG,
+            "%s complete",
+            grasp_goal_name(grasp_state.goal)
+        );
+
+
+        grasp_state.active = false;
+
+
+        return;
+    }
+
+
+    grasp_state.next_update_us =
+        now + GRASP_UPDATE_PERIOD_US;
 }
 
 
@@ -1566,6 +1888,138 @@ void update_wave(
 }
 
 
+// ============================================================
+// Dispatch one complete serial command
+// ============================================================
+
+void handle_serial_command(
+    i2c_master_dev_handle_t device,
+    const char *text)
+{
+    if (actuator::matches_command_word(
+            text,
+            "close")) {
+
+        if (wave_is_active()) {
+            cancel_wave();
+        }
+
+        start_grasp(
+            GraspGoal::CLOSE
+        );
+
+        return;
+    }
+
+
+    if (actuator::matches_command_word(
+            text,
+            "open")) {
+
+        if (wave_is_active()) {
+            cancel_wave();
+        }
+
+        start_grasp(
+            GraspGoal::OPEN
+        );
+
+        return;
+    }
+
+
+    float wave_duration_s = 0.0f;
+
+
+    const int wave_result =
+        parse_wave_command(
+            text,
+            wave_duration_s
+        );
+
+
+    if (wave_result == 1) {
+
+        if (grasp_is_active()) {
+            cancel_grasp();
+        }
+
+        start_wave(
+            device,
+            wave_duration_s
+        );
+
+        return;
+    }
+
+
+    if (wave_result == -1) {
+
+        ESP_LOGW(
+            TAG,
+            "Invalid wave command. "
+            "Use wave or wave,<seconds>; "
+            "range %.0f-%.0f s",
+            MIN_WAVE_DURATION_S,
+            MAX_WAVE_DURATION_S
+        );
+
+        return;
+    }
+
+
+    actuator::Command command = {};
+
+
+    if (!actuator::parse_command(
+            text,
+            MOTOR_COUNT,
+            command)) {
+
+        ESP_LOGW(
+            TAG,
+            "Invalid command: %s. Use close, open, "
+            "P,<position_mm>,<motor_id>, or wave,<seconds>",
+            text
+        );
+
+        return;
+    }
+
+
+    bool automatic_motion_interrupted = false;
+
+
+    if (wave_is_active()) {
+        cancel_wave();
+        automatic_motion_interrupted = true;
+    }
+
+
+    if (grasp_is_active()) {
+        cancel_grasp();
+        automatic_motion_interrupted = true;
+    }
+
+
+    if (automatic_motion_interrupted) {
+
+        ESP_LOGI(
+            TAG,
+            "Manual P command now has control"
+        );
+    }
+
+
+    set_position_mm(
+        device,
+        command.motor_id,
+        command.position_mm,
+        true
+    );
+}
+
+
 } // namespace
 
 
@@ -1753,7 +2207,7 @@ extern "C" void app_main()
 
 
     // ========================================================
-    // Startup: all motors to midpoint
+    // Startup: all motors to open pose
     // ========================================================
 
     ESP_LOGI(
@@ -1800,11 +2254,11 @@ extern "C" void app_main()
 
     ESP_LOGI(
         TAG,
-        "Moving all motors to startup midpoint"
+        "Moving all motors to OPEN pose (0 mm)"
     );
 
 
-    if (!move_all_to_midpoint(
+    if (!move_all_to_zero(
             pca_handle,
             true)) {
 
@@ -1820,6 +2274,20 @@ extern "C" void app_main()
         TAG,
 
         "Commands:"
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "  close                       150 ms staggered grasp"
+    );
+
+
+    ESP_LOGI(
+        TAG,
+
+        "  open                        150 ms staggered return"
     );
 
 
@@ -1936,103 +2404,10 @@ extern "C" void app_main()
 
                     else {
 
-                        // ====================================
-                        // First try WAVE command
-                        // ====================================
-
-                        float wave_duration_s = 0.0f;
-
-
-                        const int wave_result =
-                            parse_wave_command(
-                                command_buffer,
-                                wave_duration_s
-                            );
-
-
-                        if (wave_result == 1) {
-
-
-                            start_wave(
-                                pca_handle,
-                                wave_duration_s
-                            );
-                        }
-
-
-                        else if (wave_result == -1) {
-
-
-                            ESP_LOGW(
-                                TAG,
-
-                                "Invalid wave command. "
-                                "Use wave or wave,<seconds>; "
-                                "range %.0f-%.0f s",
-
-                                MIN_WAVE_DURATION_S,
-
-                                MAX_WAVE_DURATION_S
-                            );
-                        }
-
-
-                        // ====================================
-                        // Otherwise try P command
-                        // ====================================
-
-                        else {
-
-
-                            actuator::Command command = {};
-
-
-                            if (!actuator::parse_command(
-                                    command_buffer,
-                                    MOTOR_COUNT,
-                                    command)) {
-
-
-                                ESP_LOGW(
-                                    TAG,
-
-                                    "Invalid command: %s. "
-                                    "Use P,<position_mm>,<motor_id> "
-                                    "or wave,<seconds>",
-
-                                    command_buffer
-                                );
-                            }
-
-                            else {
-
-
-                                // ============================
-                                // P immediately interrupts wave
-                                // ============================
-
-                                if (wave_is_active()) {
-
-
-                                    cancel_wave();
-
-
-                                    ESP_LOGI(
-                                        TAG,
-
-                                        "Manual P command now has control"
-                                    );
-                                }
-
-
-                                set_position_mm(
-                                    pca_handle,
-                                    command.motor_id,
-                                    command.position_mm,
-                                    true
-                                );
-                            }
-                        }
+                        handle_serial_command(
+                            pca_handle,
+                            command_buffer
+                        );
                     }
 
 
@@ -2118,10 +2493,16 @@ extern "C" void app_main()
 
 
         // ====================================================
-        // Non-blocking WAVE update
+        // Non-blocking automatic motion updates
         // ====================================================
 
         update_wave(
+            pca_handle,
+            now
+        );
+
+
+        update_grasp(
             pca_handle,
             now
         );
